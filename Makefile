@@ -2,7 +2,7 @@ BINARY := llmirror
 VERSION ?= dev
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: build build-all clean test
+.PHONY: build build-all clean test test-integration
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/llmirror
@@ -17,3 +17,6 @@ clean:
 
 test:
 	go test ./...
+
+test-integration: build
+	./scripts/ci-peer-sync.sh

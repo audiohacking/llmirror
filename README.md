@@ -133,6 +133,16 @@ Release binaries (Linux amd64/arm64, macOS arm64) are built and attached automat
 make build-all   # linux-amd64, linux-arm64, darwin-arm64
 ```
 
+## CI
+
+- Unit tests on every push/PR
+- Peer-sync integration: downloads a tiny HF model into peer A, serves it, then peer B fetches with `--skip-hf` (must succeed from the peer alone)
+
+```bash
+make test
+make test-integration   # needs hf / huggingface-cli
+```
+
 ## Architecture notes
 
 | Component | Role |
