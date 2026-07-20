@@ -8,15 +8,16 @@ import (
 	"strings"
 )
 
-// Model holds metadata about a cached Hugging Face model repository.
+// Model holds metadata about a cached Hugging Face hub repository.
 type Model struct {
 	RepoID    string            `json:"repo_id"`
+	RepoType  string            `json:"repo_type"`
 	Folder    string            `json:"folder"`
-	Revisions []string          `json:"revisions"` // commit hashes present under snapshots/
-	Refs      map[string]string `json:"refs"`      // named ref (main, tag) → commit hash
+	Revisions []string          `json:"revisions"`
+	Refs      map[string]string `json:"refs"`
 }
 
-// ScanModels lists model repositories present in the HF hub cache.
+// ScanModels lists hub repositories (models, datasets, spaces) in the HF cache.
 func ScanModels(hubDir string) ([]Model, error) {
 	entries, err := os.ReadDir(hubDir)
 	if err != nil {
@@ -28,10 +29,10 @@ func ScanModels(hubDir string) ([]Model, error) {
 
 	var models []Model
 	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), modelPrefix) {
+		if !entry.IsDir() {
 			continue
 		}
-		repoID, err := RepoIDFromFolder(entry.Name())
+		repoID, repoType, err := RepoIDFromFolder(entry.Name())
 		if err != nil {
 			continue
 		}
@@ -43,6 +44,7 @@ func ScanModels(hubDir string) ([]Model, error) {
 		refs, _ := listRefs(repoDir)
 		models = append(models, Model{
 			RepoID:    repoID,
+			RepoType:  repoType.String(),
 			Folder:    entry.Name(),
 			Revisions: revisions,
 			Refs:      refs,
@@ -92,20 +94,17 @@ func listRefs(repoDir string) (map[string]string, error) {
 	return refs, nil
 }
 
-// ResolveRevision returns the commit hash for a named ref (e.g. "main") or the hash itself.
-// Accepts full 40-char hashes and unique prefixes of cached snapshot hashes.
+// ResolveRevision returns the commit hash for a named ref or the hash itself.
 func ResolveRevision(repoDir, revision string) (string, error) {
 	revision = strings.TrimSpace(revision)
 	if revision == "" {
 		revision = "main"
 	}
 
-	// Exact snapshot directory match (full commit hash).
 	if _, err := os.Stat(filepath.Join(repoDir, "snapshots", revision)); err == nil {
 		return revision, nil
 	}
 
-	// Named ref (main, tags, etc.).
 	refPath := filepath.Join(repoDir, "refs", revision)
 	if data, err := os.ReadFile(refPath); err == nil {
 		hash := strings.TrimSpace(string(data))
@@ -118,7 +117,6 @@ func ResolveRevision(repoDir, revision string) (string, error) {
 		return "", fmt.Errorf("ref %q points to %s but snapshot is missing", revision, hash)
 	}
 
-	// Unique prefix match against snapshot hashes.
 	if len(revision) >= 7 && len(revision) < 40 {
 		revs, err := listRevisions(repoDir)
 		if err == nil {
@@ -140,9 +138,13 @@ func ResolveRevision(repoDir, revision string) (string, error) {
 	return "", fmt.Errorf("revision %q not found in cache", revision)
 }
 
-// HasRevision reports whether the model revision resolves and has at least one snapshot file.
-func HasRevision(hubDir, repoID, revision string) (bool, error) {
-	repoDir := filepath.Join(hubDir, RepoFolderName(repoID))
+// HasRevision reports whether the repo revision resolves and has at least one snapshot file.
+func HasRevision(hubDir, repoID, revision string, repoType ...RepoType) (bool, error) {
+	t := RepoModel
+	if len(repoType) > 0 {
+		t = repoType[0]
+	}
+	repoDir := filepath.Join(hubDir, RepoFolderName(repoID, t))
 	if _, err := os.Stat(repoDir); err != nil {
 		return false, nil
 	}
@@ -168,9 +170,13 @@ func HasRevision(hubDir, repoID, revision string) (bool, error) {
 	return found && err == nil, nil
 }
 
-// ResolveFilePath returns the on-disk path for a file inside a snapshot (following symlinks to blobs).
-func ResolveFilePath(hubDir, repoID, revision, filename string) (absPath string, blobHash string, size int64, err error) {
-	repoDir := filepath.Join(hubDir, RepoFolderName(repoID))
+// ResolveFilePath returns the on-disk path for a file inside a snapshot.
+func ResolveFilePath(hubDir, repoID, revision, filename string, repoType ...RepoType) (absPath string, blobHash string, size int64, err error) {
+	t := RepoModel
+	if len(repoType) > 0 {
+		t = repoType[0]
+	}
+	repoDir := filepath.Join(hubDir, RepoFolderName(repoID, t))
 	hash, err := ResolveRevision(repoDir, revision)
 	if err != nil {
 		return "", "", 0, err

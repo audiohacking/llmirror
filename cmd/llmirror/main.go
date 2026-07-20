@@ -4,15 +4,19 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/lmangani/llmirror/internal/auth"
 	"github.com/lmangani/llmirror/internal/cache"
 	"github.com/lmangani/llmirror/internal/cdnproxy"
 	"github.com/lmangani/llmirror/internal/download"
 	"github.com/lmangani/llmirror/internal/hf"
+	"github.com/lmangani/llmirror/internal/netacl"
 	"github.com/lmangani/llmirror/internal/peer"
+	"github.com/lmangani/llmirror/internal/service"
 	"github.com/spf13/cobra"
 )
 
@@ -28,12 +32,10 @@ func newRoot() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "llmirror",
 		Short: "P2P mirror for Hugging Face model cache across your fleet",
-		Long: `llmirror shares Hugging Face hub cache between hosts on your network.
+		Long: `llmirror shares Hugging Face hub cache between hosts on your LAN.
 
-Before hitting huggingface.co, it checks the local HF cache and peers on the LAN.
-Models land in the same paths as huggingface-cli (HF_HUB_CACHE / ~/.cache/huggingface/hub).
-
-Run 'llmirror serve' on each host, then use 'llmirror download org/model' or alias hf to llmirror.`,
+Secure by default: only private/local clients are accepted, optional shared
+fleet token, and install-service wires systemd/launchd with those defaults.`,
 	}
 
 	root.AddCommand(
@@ -43,6 +45,8 @@ Run 'llmirror serve' on each host, then use 'llmirror download org/model' or ali
 		cmdScan(),
 		cmdPeers(),
 		cmdProxy(),
+		cmdInstallService(),
+		cmdUninstallService(),
 		&cobra.Command{
 			Use:   "version",
 			Short: "Print version",
@@ -55,10 +59,8 @@ Run 'llmirror serve' on each host, then use 'llmirror download org/model' or ali
 }
 
 func cmdDownload() *cobra.Command {
-	var revision string
-	var peersFile string
-	var skipPeers bool
-	var skipHF bool
+	var revision, peersFile, repoType, token, tokenFile, group, groupFile string
+	var skipPeers, skipHF bool
 
 	cmd := &cobra.Command{
 		Use:   "download REPO_ID [HF_FLAGS...]",
@@ -69,33 +71,55 @@ func cmdDownload() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			repoID := args[0]
-			extra := args[1:]
+			tok, err := auth.LoadToken(token, tokenFile)
+			if err != nil {
+				return err
+			}
+			grp, err := auth.LoadGroup(group, groupFile)
+			if err != nil {
+				return err
+			}
 			return download.Resolve(download.Options{
 				HubDir:      hubDir,
-				RepoID:      repoID,
+				RepoID:      args[0],
+				RepoType:    cache.ParseRepoType(repoType),
 				Revision:    revision,
 				PeersFile:   peersFile,
 				SkipPeers:   skipPeers,
 				SkipHF:      skipHF,
-				HFExtraArgs: extra,
+				Token:       tok,
+				Group:       grp,
+				HFExtraArgs: args[1:],
 			})
 		},
 	}
 	cmd.Flags().StringVar(&revision, "revision", "main", "Model revision (branch, tag, or commit)")
+	cmd.Flags().StringVar(&repoType, "repo-type", "model", "Repo type: model, dataset, or space")
 	cmd.Flags().StringVar(&peersFile, "peers-file", defaultPeersFile(), "Static peer list (one URL per line)")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet shared token (or LLMIRROR_TOKEN)")
+	cmd.Flags().StringVar(&tokenFile, "token-file", defaultTokenFile(), "Fleet token file")
+	cmd.Flags().StringVar(&group, "group", "", "Fleet group id (or LLMIRROR_GROUP)")
+	cmd.Flags().StringVar(&groupFile, "group-file", defaultGroupFile(), "Fleet group file")
 	cmd.Flags().BoolVar(&skipPeers, "skip-peers", false, "Do not query fleet peers")
 	cmd.Flags().BoolVar(&skipHF, "skip-hf", false, "Fail instead of falling back to Hugging Face")
 	return cmd
 }
 
 func cmdServe() *cobra.Command {
-	var addr string
-	var peersFile string
+	var addr, peersFile, token, tokenFile, group, groupFile, allow string
+	var allowPublic bool
 
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Serve local HF cache to peers on the network",
+		Short: "Serve local HF cache to LAN peers (private networks only)",
+		Long: `Expose the local Hugging Face hub cache to other hosts on your private network.
+
+Security defaults:
+  • Only RFC1918 / loopback / link-local clients are accepted
+  • X-Forwarded-For is ignored (cannot spoof client IP via proxy headers)
+  • Fleet group (--group) isolates mDNS discovery and HTTP access
+  • Optional shared token (--token / LLMIRROR_TOKEN) required when configured
+  • Use --allow to add extra private CIDRs; --allow-public is an explicit escape hatch`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			hubDir, err := cache.HubDir()
 			if err != nil {
@@ -104,27 +128,124 @@ func cmdServe() *cobra.Command {
 			if addr == "" {
 				addr = ":7947"
 			}
-			host, portStr, _ := strings.Cut(addr, ":")
+			tok, err := auth.LoadToken(token, tokenFile)
+			if err != nil {
+				return err
+			}
+			grp, err := auth.LoadGroup(group, groupFile)
+			if err != nil {
+				return err
+			}
+
+			var acl *netacl.ACL
+			if allowPublic {
+				fmt.Fprintln(os.Stderr, "WARNING: --allow-public disables network ACL; anyone who can reach this port can read your HF cache")
+			} else {
+				cidrs := netacl.ParseAllowList(allow)
+				acl, err = netacl.New(cidrs)
+				if err != nil {
+					return err
+				}
+			}
+
+			host, portStr, _ := strings.Cut(normalizeListen(addr), ":")
 			if host == "" {
 				host = "0.0.0.0"
 			}
 			port, _ := strconv.Atoi(portStr)
 
-			d := peer.NewDiscovery(hostname(), port)
+			d := peer.NewDiscovery(hostname(), port, grp)
 			if err := d.Advertise(); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: mDNS advertise failed: %v\n", err)
 			}
 			defer d.Shutdown()
 
 			fmt.Printf("llmirror: serving %s on http://%s:%d\n", hubDir, listenHost(host), port)
-			if peersFile != "" {
-				fmt.Printf("llmirror: static peers file: %s\n", peersFile)
+			if grp != "" {
+				fmt.Printf("llmirror: fleet group %q\n", grp)
+			} else {
+				fmt.Fprintln(os.Stderr, "warning: no fleet group set; mDNS peers from any group are visible (set --group or LLMIRROR_GROUP)")
 			}
-			return (&peer.Server{HubDir: hubDir, Addr: addr}).ListenAndServe()
+			if tok != "" {
+				fmt.Println("llmirror: fleet token auth enabled")
+			} else {
+				fmt.Fprintln(os.Stderr, "warning: no fleet token set; any host on your LAN (same group) can pull models (set --token-file or LLMIRROR_TOKEN)")
+			}
+			if !allowPublic {
+				fmt.Println("llmirror: network ACL = private/local only")
+			}
+			return (&peer.Server{HubDir: hubDir, Addr: addr, Token: tok, Group: grp, ACL: acl}).ListenAndServe()
 		},
 	}
-	cmd.Flags().StringVar(&addr, "addr", ":7947", "Listen address (default :7947)")
+	cmd.Flags().StringVar(&addr, "addr", ":7947", "Listen address")
 	cmd.Flags().StringVar(&peersFile, "peers-file", defaultPeersFile(), "Static peer list path")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet shared token")
+	cmd.Flags().StringVar(&tokenFile, "token-file", defaultTokenFile(), "Fleet token file")
+	cmd.Flags().StringVar(&group, "group", "", "Fleet group id")
+	cmd.Flags().StringVar(&groupFile, "group-file", defaultGroupFile(), "Fleet group file")
+	cmd.Flags().StringVar(&allow, "allow", "", "Extra allowed CIDRs (comma-separated); default is private nets only")
+	cmd.Flags().BoolVar(&allowPublic, "allow-public", false, "Disable network ACL (dangerous)")
+	return cmd
+}
+
+func cmdCDNProxy() *cobra.Command {
+	var addr, peersFile, upstream, token, tokenFile, group, groupFile, allow string
+	var skipPeers, allowPublic bool
+
+	cmd := &cobra.Command{
+		Use:   "cdn-proxy",
+		Short: "HF_ENDPOINT reverse proxy (default: loopback only)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			hubDir, err := cache.HubDir()
+			if err != nil {
+				return err
+			}
+			if addr == "" {
+				addr = "127.0.0.1:7950"
+			}
+			tok, err := auth.LoadToken(token, tokenFile)
+			if err != nil {
+				return err
+			}
+			grp, err := auth.LoadGroup(group, groupFile)
+			if err != nil {
+				return err
+			}
+			var acl *netacl.ACL
+			if !allowPublic {
+				cidrs := netacl.ParseAllowList(allow)
+				if len(cidrs) == 0 {
+					cidrs = []string{"127.0.0.0/8", "::1/128"}
+				}
+				acl, err = netacl.New(cidrs)
+				if err != nil {
+					return err
+				}
+			} else {
+				fmt.Fprintln(os.Stderr, "WARNING: cdn-proxy --allow-public disables ACL")
+			}
+			return cdnproxy.New(cdnproxy.Config{
+				HubDir:    hubDir,
+				Addr:      addr,
+				Upstream:  upstream,
+				PeersFile: peersFile,
+				SkipPeers: skipPeers,
+				Token:     tok,
+				Group:     grp,
+				ACL:       acl,
+			}).ListenAndServe()
+		},
+	}
+	cmd.Flags().StringVar(&addr, "addr", "127.0.0.1:7950", "Listen address (loopback by default)")
+	cmd.Flags().StringVar(&upstream, "upstream", "https://huggingface.co", "Upstream Hub endpoint")
+	cmd.Flags().StringVar(&peersFile, "peers-file", defaultPeersFile(), "Static peer list")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet token for peer fetches")
+	cmd.Flags().StringVar(&tokenFile, "token-file", defaultTokenFile(), "Fleet token file")
+	cmd.Flags().StringVar(&group, "group", "", "Fleet group id")
+	cmd.Flags().StringVar(&groupFile, "group-file", defaultGroupFile(), "Fleet group file")
+	cmd.Flags().StringVar(&allow, "allow", "", "Allowed CIDRs (default: loopback only)")
+	cmd.Flags().BoolVar(&allowPublic, "allow-public", false, "Disable network ACL (dangerous)")
+	cmd.Flags().BoolVar(&skipPeers, "skip-peers", false, "Do not query fleet peers")
 	return cmd
 }
 
@@ -147,7 +268,7 @@ func cmdScan() *cobra.Command {
 				return nil
 			}
 			for _, m := range models {
-				fmt.Printf("%s  [%s]\n", m.RepoID, strings.Join(m.Revisions, ", "))
+				fmt.Printf("%s  (%s)  [%s]\n", m.RepoID, m.RepoType, strings.Join(m.Revisions, ", "))
 			}
 			return nil
 		},
@@ -155,13 +276,16 @@ func cmdScan() *cobra.Command {
 }
 
 func cmdPeers() *cobra.Command {
-	var peersFile string
-
-	return &cobra.Command{
+	var peersFile, group, groupFile string
+	cmd := &cobra.Command{
 		Use:   "peers",
 		Short: "Discover llmirror peers on the network",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			list, err := peer.DiscoverPeers(peersFile, peerBrowseTimeout())
+			grp, err := auth.LoadGroup(group, groupFile)
+			if err != nil {
+				return err
+			}
+			list, err := peer.DiscoverPeers(peersFile, peerBrowseTimeout(), grp)
 			if err != nil {
 				return err
 			}
@@ -175,54 +299,14 @@ func cmdPeers() *cobra.Command {
 			return nil
 		},
 	}
-}
-
-func cmdCDNProxy() *cobra.Command {
-	var addr string
-	var peersFile string
-	var upstream string
-	var skipPeers bool
-
-	cmd := &cobra.Command{
-		Use:   "cdn-proxy",
-		Short: "HF_ENDPOINT reverse proxy (local → peers → huggingface.co)",
-		Long: `Run a reverse proxy compatible with huggingface_hub's HF_ENDPOINT.
-
-Point Python libraries at this proxy so resolve/raw downloads try the local
-HF cache and fleet peers before huggingface.co:
-
-  export HF_ENDPOINT=http://127.0.0.1:7950
-  llmirror cdn-proxy --addr :7950
-
-API and non-model traffic is forwarded upstream unchanged.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			hubDir, err := cache.HubDir()
-			if err != nil {
-				return err
-			}
-			if addr == "" {
-				addr = ":7950"
-			}
-			return cdnproxy.New(cdnproxy.Config{
-				HubDir:    hubDir,
-				Addr:      addr,
-				Upstream:  upstream,
-				PeersFile: peersFile,
-				SkipPeers: skipPeers,
-			}).ListenAndServe()
-		},
-	}
-	cmd.Flags().StringVar(&addr, "addr", ":7950", "Listen address")
-	cmd.Flags().StringVar(&upstream, "upstream", "https://huggingface.co", "Upstream Hub endpoint")
 	cmd.Flags().StringVar(&peersFile, "peers-file", defaultPeersFile(), "Static peer list")
-	cmd.Flags().BoolVar(&skipPeers, "skip-peers", false, "Do not query fleet peers")
+	cmd.Flags().StringVar(&group, "group", "", "Fleet group id")
+	cmd.Flags().StringVar(&groupFile, "group-file", defaultGroupFile(), "Fleet group file")
 	return cmd
 }
 
-// cmdProxy implements drop-in replacement: llmirror proxy -- hf download ...
 func cmdProxy() *cobra.Command {
-	var peersFile string
-
+	var peersFile, token, tokenFile, group, groupFile string
 	cmd := &cobra.Command{
 		Use:   "proxy -- COMMAND [ARGS...]",
 		Short: "Intercept HF download commands (use as hf alias)",
@@ -232,6 +316,14 @@ func cmdProxy() *cobra.Command {
 			}
 			if hf.IsHFInvocation(args) && len(args) >= 3 {
 				hubDir, err := cache.HubDir()
+				if err != nil {
+					return err
+				}
+				tok, err := auth.LoadToken(token, tokenFile)
+				if err != nil {
+					return err
+				}
+				grp, err := auth.LoadGroup(group, groupFile)
 				if err != nil {
 					return err
 				}
@@ -247,14 +339,15 @@ func cmdProxy() *cobra.Command {
 					extra = append(extra, args[i])
 				}
 				return download.Resolve(download.Options{
-					HubDir:    hubDir,
-					RepoID:    repoID,
-					Revision:  revision,
-					PeersFile: peersFile,
+					HubDir:      hubDir,
+					RepoID:      repoID,
+					Revision:    revision,
+					PeersFile:   peersFile,
+					Token:       tok,
+					Group:       grp,
 					HFExtraArgs: extra,
 				})
 			}
-			// Not a download: pass through to real hf binary.
 			path := hf.CLIPath()
 			if path == "" {
 				return fmt.Errorf("hf not found")
@@ -263,6 +356,55 @@ func cmdProxy() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&peersFile, "peers-file", defaultPeersFile(), "Static peer list")
+	cmd.Flags().StringVar(&token, "token", "", "Fleet shared token")
+	cmd.Flags().StringVar(&tokenFile, "token-file", defaultTokenFile(), "Fleet token file")
+	cmd.Flags().StringVar(&group, "group", "", "Fleet group id")
+	cmd.Flags().StringVar(&groupFile, "group-file", defaultGroupFile(), "Fleet group file")
+	return cmd
+}
+
+func cmdInstallService() *cobra.Command {
+	var addr, allow, group string
+	var system bool
+	cmd := &cobra.Command{
+		Use:   "install-service",
+		Short: "Install llmirror serve as a background service (systemd / launchd)",
+		Long: `Installs a user-level service by default (systemd --user on Linux, LaunchAgent on macOS).
+
+Generates ~/.config/llmirror/token and ~/.config/llmirror/group if missing,
+and enables private-network-only serve scoped to that fleet group.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			bin, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			bin, _ = filepath.Abs(bin)
+			return service.Install(service.Options{
+				BinaryPath: bin,
+				Addr:       addr,
+				AllowCIDRs: allow,
+				Group:      group,
+				UserScope:  !system,
+			})
+		},
+	}
+	cmd.Flags().StringVar(&addr, "addr", ":7947", "Listen address for the service")
+	cmd.Flags().StringVar(&allow, "allow", "", "Extra allowed CIDRs")
+	cmd.Flags().StringVar(&group, "group", "", "Fleet group id (generated if omitted)")
+	cmd.Flags().BoolVar(&system, "system", false, "Install system-wide unit (requires root on Linux)")
+	return cmd
+}
+
+func cmdUninstallService() *cobra.Command {
+	var system bool
+	cmd := &cobra.Command{
+		Use:   "uninstall-service",
+		Short: "Remove the background service",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return service.Uninstall(!system)
+		},
+	}
+	cmd.Flags().BoolVar(&system, "system", false, "Remove system-wide unit")
 	return cmd
 }
 
@@ -282,7 +424,31 @@ func defaultPeersFile() string {
 		return v
 	}
 	home, _ := os.UserHomeDir()
-	return home + "/.config/llmirror/peers"
+	return filepath.Join(home, ".config", "llmirror", "peers")
+}
+
+func defaultTokenFile() string {
+	if v := os.Getenv("LLMIRROR_TOKEN_FILE"); v != "" {
+		return v
+	}
+	home, _ := os.UserHomeDir()
+	p := filepath.Join(home, ".config", "llmirror", "token")
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return ""
+}
+
+func defaultGroupFile() string {
+	if v := os.Getenv("LLMIRROR_GROUP_FILE"); v != "" {
+		return v
+	}
+	home, _ := os.UserHomeDir()
+	p := filepath.Join(home, ".config", "llmirror", "group")
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	return ""
 }
 
 func hostname() string {
@@ -298,6 +464,13 @@ func listenHost(bind string) string {
 		return "0.0.0.0"
 	}
 	return bind
+}
+
+func normalizeListen(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "0.0.0.0" + addr
+	}
+	return addr
 }
 
 func peerBrowseTimeout() time.Duration {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lmangani/llmirror/internal/cache"
+	"github.com/lmangani/llmirror/internal/netacl"
 	"github.com/lmangani/llmirror/internal/peer"
 )
 
@@ -21,10 +22,13 @@ const defaultUpstream = "https://huggingface.co"
 type Config struct {
 	HubDir      string
 	Addr        string
-	Upstream    string // e.g. https://huggingface.co
+	Upstream    string
 	PeersFile   string
 	PeerTimeout time.Duration
 	SkipPeers   bool
+	Token       string
+	Group       string
+	ACL         *netacl.ACL
 }
 
 // Server intercepts Hub resolve/raw downloads: local → peers → upstream.
@@ -52,17 +56,26 @@ func New(cfg Config) *Server {
 				return nil
 			},
 		},
-		peers: peer.NewClient(),
+		peers: peer.NewClient(cfg.Token, cfg.Group),
 	}
 }
 
-func (s *Server) ListenAndServe() error {
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
+	var h http.Handler = mux
+	// CDN proxy is for local Python libs — still apply ACL (defaults to loopback+private).
+	if s.cfg.ACL != nil {
+		h = s.cfg.ACL.Middleware(h)
+	}
+	return h
+}
+
+func (s *Server) ListenAndServe() error {
 	log.Printf("llmirror cdn-proxy: listening on %s", s.cfg.Addr)
 	log.Printf("llmirror cdn-proxy: set HF_ENDPOINT=http://127.0.0.1%s", displayPort(s.cfg.Addr))
 	log.Printf("llmirror cdn-proxy: upstream %s, hub cache %s", s.cfg.Upstream, s.cfg.HubDir)
-	return http.ListenAndServe(s.cfg.Addr, mux)
+	return http.ListenAndServe(s.cfg.Addr, s.Handler())
 }
 
 func displayPort(addr string) string {
@@ -87,21 +100,20 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1) Local HF cache
-	if abs, blobHash, size, err := cache.ResolveFilePath(s.cfg.HubDir, req.RepoID, req.Revision, req.Filename); err == nil {
+	repoType := cache.ParseRepoType(req.RepoType)
+
+	if abs, blobHash, size, err := cache.ResolveFilePath(s.cfg.HubDir, req.RepoID, req.Revision, req.Filename, repoType); err == nil {
 		log.Printf("cdn-proxy: local %s@%s/%s", req.RepoID, req.Revision, req.Filename)
 		s.serveFile(w, r, abs, blobHash, size)
 		return
 	}
 
-	// 2) Fleet peers
 	if !s.cfg.SkipPeers {
-		if s.tryPeers(w, r, req) {
+		if s.tryPeers(w, r, req, repoType) {
 			return
 		}
 	}
 
-	// 3) Upstream Hugging Face (follows CDN redirects)
 	log.Printf("cdn-proxy: upstream %s@%s/%s", req.RepoID, req.Revision, req.Filename)
 	s.proxyUpstream(w, r)
 }
@@ -111,15 +123,10 @@ type ResolveReq struct {
 	RepoID   string
 	Revision string
 	Filename string
-	RepoType string // model, dataset, space
+	RepoType string
 }
 
-// ParseResolvePath matches HF Hub download URL shapes used with HF_ENDPOINT:
-//
-//	/{repo_id}/resolve/{revision}/{filename}
-//	/{repo_id}/raw/{revision}/{filename}
-//	/models/{repo_id}/resolve/{revision}/{filename}
-//	/datasets/{repo_id}/resolve/{revision}/{filename}
+// ParseResolvePath matches HF Hub download URL shapes used with HF_ENDPOINT.
 func ParseResolvePath(urlPath string) (ResolveReq, bool) {
 	urlPath = path.Clean("/" + strings.TrimPrefix(urlPath, "/"))
 	parts := strings.Split(strings.Trim(urlPath, "/"), "/")
@@ -147,7 +154,6 @@ func ParseResolvePath(urlPath string) (ResolveReq, bool) {
 			break
 		}
 	}
-	// Need: [repo...] resolve|raw revision filename...
 	if kindIdx < 1 || kindIdx+2 >= len(parts) {
 		return ResolveReq{}, false
 	}
@@ -160,11 +166,7 @@ func ParseResolvePath(urlPath string) (ResolveReq, bool) {
 	filename := strings.Join(parts[kindIdx+2:], "/")
 	filename, _ = url.PathUnescape(filename)
 
-	// Local/peer cache currently only covers model hub folders (models--...).
-	if repoType != "model" {
-		return ResolveReq{}, false
-	}
-
+	// Local/peer cache covers models, datasets, and spaces.
 	return ResolveReq{
 		RepoID:   repoID,
 		Revision: revision,
@@ -173,16 +175,16 @@ func ParseResolvePath(urlPath string) (ResolveReq, bool) {
 	}, true
 }
 
-func (s *Server) tryPeers(w http.ResponseWriter, r *http.Request, req ResolveReq) bool {
-	peers, err := peer.DiscoverPeers(s.cfg.PeersFile, s.cfg.PeerTimeout)
+func (s *Server) tryPeers(w http.ResponseWriter, r *http.Request, req ResolveReq, repoType cache.RepoType) bool {
+	peers, err := peer.DiscoverPeers(s.cfg.PeersFile, s.cfg.PeerTimeout, s.cfg.Group)
 	if err != nil || len(peers) == 0 {
 		return false
 	}
-	peerURL, err := peer.FindPeerWithModel(peers, req.RepoID, req.Revision)
+	peerURL, err := peer.FindPeerWithModel(peers, req.RepoID, req.Revision, repoType, s.cfg.Token, s.cfg.Group)
 	if err != nil {
 		return false
 	}
-	blobHash, size, ok, err := s.peers.PeerHasFile(peerURL, req.RepoID, req.Revision, req.Filename)
+	blobHash, size, ok, err := s.peers.PeerHasFile(peerURL, req.RepoID, req.Revision, req.Filename, repoType)
 	if err != nil || !ok {
 		return false
 	}
@@ -198,7 +200,6 @@ func (s *Server) tryPeers(w http.ResponseWriter, r *http.Request, req ResolveReq
 		w.WriteHeader(http.StatusOK)
 		return true
 	}
-	// Once we start writing the body, the response is committed — do not fall back.
 	if err := s.peers.FetchBlob(peerURL, blobHash, 0, w); err != nil {
 		log.Printf("cdn-proxy: peer fetch error (response may be partial): %v", err)
 	}
@@ -244,6 +245,13 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request) {
 	outReq.Header.Del("Accept-Encoding")
 	outReq.Host = upstream.Host
 
+	// Prefer client-provided Hub auth; otherwise inject HF_TOKEN from the proxy host.
+	if outReq.Header.Get("Authorization") == "" {
+		if tok := hfTokenFromEnv(); tok != "" {
+			outReq.Header.Set("Authorization", "Bearer "+tok)
+		}
+	}
+
 	resp, err := s.client.Do(outReq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -269,4 +277,11 @@ func copyHeaders(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+func hfTokenFromEnv() string {
+	if v := os.Getenv("HF_TOKEN"); v != "" {
+		return v
+	}
+	return os.Getenv("HUGGING_FACE_HUB_TOKEN")
 }

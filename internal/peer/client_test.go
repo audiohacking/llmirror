@@ -25,8 +25,8 @@ func TestHasRevisionEndpoint(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	client := NewClient()
-	has, err := client.HasRevision(ts.URL, repoID, "main")
+	client := NewClient("")
+	has, err := client.HasRevision(ts.URL, repoID, "main", cache.RepoModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestHasRevisionEndpoint(t *testing.T) {
 		t.Fatalf("got %+v", has)
 	}
 
-	has, err = client.HasRevision(ts.URL, repoID, "other")
+	has, err = client.HasRevision(ts.URL, repoID, "other", cache.RepoModel)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,11 +42,11 @@ func TestHasRevisionEndpoint(t *testing.T) {
 		t.Fatal("expected missing revision")
 	}
 
-	peerURL, err := FindPeerWithModel([]string{ts.URL}, repoID, "main")
+	peerURL, err := FindPeerWithModel([]string{ts.URL}, repoID, "main", cache.RepoModel, "", "")
 	if err != nil || peerURL != ts.URL {
 		t.Fatalf("FindPeerWithModel: %v %s", err, peerURL)
 	}
-	_, err = FindPeerWithModel([]string{ts.URL}, repoID, "nope")
+	_, err = FindPeerWithModel([]string{ts.URL}, repoID, "nope", cache.RepoModel, "", "")
 	if err == nil {
 		t.Fatal("expected error for missing revision")
 	}
@@ -65,7 +65,7 @@ func TestBlobRangeResume(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	client := NewClient()
+	client := NewClient("")
 	var buf []byte
 	w := &appendWriter{b: &buf}
 	if err := client.FetchBlob(ts.URL, hash, 0, w); err != nil {
@@ -115,5 +115,54 @@ func TestListModelsIncludesRefs(t *testing.T) {
 	}
 	if len(models) != 1 || models[0].Refs["main"] != hash {
 		t.Fatalf("got %+v", models)
+	}
+}
+
+func TestTokenAuthRequired(t *testing.T) {
+	hub := t.TempDir()
+	srv := &Server{HubDir: hub, Token: "secret"}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+
+	// healthz skips auth
+	resp, err = http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz %d", resp.StatusCode)
+	}
+
+	client := NewClient("secret")
+	if _, err := client.ListModels(ts.URL); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGroupMismatch(t *testing.T) {
+	hub := t.TempDir()
+	srv := &Server{HubDir: hub, Group: "lab-a"}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	bad := NewClient("", "lab-b")
+	_, err := bad.ListModels(ts.URL)
+	if err == nil {
+		t.Fatal("expected group mismatch error")
+	}
+
+	good := NewClient("", "lab-a")
+	if _, err := good.ListModels(ts.URL); err != nil {
+		t.Fatal(err)
 	}
 }

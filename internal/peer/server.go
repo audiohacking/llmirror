@@ -8,28 +8,64 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/lmangani/llmirror/internal/auth"
 	"github.com/lmangani/llmirror/internal/cache"
+	"github.com/lmangani/llmirror/internal/netacl"
 )
+
+var blobHashRe = regexp.MustCompile(`^[a-fA-F0-9]{40,64}$`)
 
 // Server exposes the local HF cache over HTTP for peer transfers.
 type Server struct {
 	HubDir string
 	Addr   string
+	Token  string
+	Group  string
+	ACL    *netacl.ACL
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/info", s.handleInfo)
 	mux.HandleFunc("/v1/models", s.handleListModels)
 	mux.HandleFunc("/v1/models/", s.handleModelRoutes)
 	mux.HandleFunc("/v1/blobs/", s.handleBlob)
-	return mux
+
+	// Authenticated API surface (token + group).
+	var api http.Handler = mux
+	api = auth.GroupMiddleware(s.Group, api)
+	api = auth.Middleware(s.Token, api)
+
+	root := http.NewServeMux()
+	root.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Llmirror-Group", s.Group)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	root.Handle("/", api)
+
+	var h http.Handler = root
+	if s.ACL != nil {
+		h = s.ACL.Middleware(h)
+	}
+	return h
 }
 
 func (s *Server) ListenAndServe() error {
 	return http.ListenAndServe(s.Addr, s.Handler())
+}
+
+func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"service": "llmirror",
+		"group":   s.Group,
+		"auth":    s.Token != "",
+	})
 }
 
 func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
@@ -64,35 +100,36 @@ func (s *Server) handleModelRoutes(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid repo id", http.StatusBadRequest)
 		return
 	}
-	// Accept both org/model and org%2Fmodel forms.
 	repoID = strings.ReplaceAll(repoID, "%2F", "/")
 
 	revision := r.URL.Query().Get("revision")
 	if revision == "" {
 		revision = "main"
 	}
+	repoType := cache.ParseRepoType(r.URL.Query().Get("repo_type"))
 
 	switch action {
 	case "has":
-		s.handleHas(w, repoID, revision)
+		s.handleHas(w, repoID, revision, repoType)
 	case "manifest":
-		s.handleManifest(w, repoID, revision)
+		s.handleManifest(w, repoID, revision, repoType)
 	}
 }
 
-func (s *Server) handleHas(w http.ResponseWriter, repoID, revision string) {
-	ok, err := cache.HasRevision(s.HubDir, repoID, revision)
+func (s *Server) handleHas(w http.ResponseWriter, repoID, revision string, repoType cache.RepoType) {
+	ok, err := cache.HasRevision(s.HubDir, repoID, revision, repoType)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	resp := map[string]any{
-		"repo_id":  repoID,
-		"revision": revision,
-		"present":  ok,
+		"repo_id":   repoID,
+		"repo_type": repoType.String(),
+		"revision":  revision,
+		"present":   ok,
 	}
 	if ok {
-		repoDir := filepath.Join(s.HubDir, cache.RepoFolderName(repoID))
+		repoDir := filepath.Join(s.HubDir, cache.RepoFolderName(repoID, repoType))
 		if hash, err := cache.ResolveRevision(repoDir, revision); err == nil {
 			resp["revision_hash"] = hash
 		}
@@ -106,8 +143,8 @@ func (s *Server) handleHas(w http.ResponseWriter, repoID, revision string) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) handleManifest(w http.ResponseWriter, repoID, revision string) {
-	repoDir := filepath.Join(s.HubDir, cache.RepoFolderName(repoID))
+func (s *Server) handleManifest(w http.ResponseWriter, repoID, revision string, repoType cache.RepoType) {
+	repoDir := filepath.Join(s.HubDir, cache.RepoFolderName(repoID, repoType))
 	hash, err := cache.ResolveRevision(repoDir, revision)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -122,6 +159,7 @@ func (s *Server) handleManifest(w http.ResponseWriter, repoID, revision string) 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"repo_id":       repoID,
+		"repo_type":     repoType.String(),
 		"revision":      revision,
 		"revision_hash": hash,
 		"files":         files,
@@ -130,7 +168,7 @@ func (s *Server) handleManifest(w http.ResponseWriter, repoID, revision string) 
 
 func (s *Server) handleBlob(w http.ResponseWriter, r *http.Request) {
 	hash := strings.TrimPrefix(r.URL.Path, "/v1/blobs/")
-	if hash == "" || strings.Contains(hash, "/") || strings.Contains(hash, "..") {
+	if !blobHashRe.MatchString(hash) {
 		http.NotFound(w, r)
 		return
 	}

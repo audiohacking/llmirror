@@ -14,33 +14,44 @@ import (
 const (
 	serviceType = "_llmirror._tcp"
 	domain      = "local."
+	txtGroupKey = "group"
+	txtVersion  = "v=1"
 )
 
 // Discovery advertises this node and finds peers via mDNS.
 type Discovery struct {
 	Instance string
 	Port     int
+	Group    string // when set, only advertise/browse peers in this group
 	Peers    chan string
 	server   *zeroconf.Server
 }
 
-func NewDiscovery(instance string, port int) *Discovery {
+func NewDiscovery(instance string, port int, group string) *Discovery {
 	return &Discovery{
 		Instance: instance,
 		Port:     port,
+		Group:    strings.TrimSpace(group),
 		Peers:    make(chan string, 16),
 	}
 }
 
 func (d *Discovery) Advertise() error {
 	host, _ := os.Hostname()
-	txt := []string{"v=1"}
+	txt := []string{txtVersion}
+	if d.Group != "" {
+		txt = append(txt, txtGroupKey+"="+d.Group)
+	}
 	srv, err := zeroconf.Register(d.Instance, serviceType, domain, d.Port, txt, nil)
 	if err != nil {
 		return fmt.Errorf("mdns advertise: %w", err)
 	}
 	d.server = srv
-	log.Printf("llmirror: advertising %s on %s port %d (host %s)", serviceType, domain, d.Port, host)
+	if d.Group != "" {
+		log.Printf("llmirror: advertising %s group=%q on port %d (host %s)", serviceType, d.Group, d.Port, host)
+	} else {
+		log.Printf("llmirror: advertising %s on port %d (host %s) — no group set (visible to all llmirror browsers)", serviceType, d.Port, host)
+	}
 	return nil
 }
 
@@ -51,6 +62,9 @@ func (d *Discovery) Browse(ctx context.Context) ([]string, error) {
 
 	go func() {
 		for entry := range entries {
+			if !groupMatch(d.Group, entry.Text) {
+				continue
+			}
 			for _, ip := range entry.AddrIPv4 {
 				base := fmt.Sprintf("http://%s:%d", ip.String(), entry.Port)
 				if _, ok := seen[base]; ok {
@@ -83,6 +97,26 @@ func (d *Discovery) Shutdown() {
 	}
 }
 
+// groupMatch returns true when local group is empty (accept all) or TXT group equals local.
+// Peers advertising no group are only accepted when local group is also empty.
+func groupMatch(localGroup string, txt []string) bool {
+	remote := txtValue(txt, txtGroupKey)
+	if localGroup == "" {
+		return true
+	}
+	return remote == localGroup
+}
+
+func txtValue(txt []string, key string) string {
+	prefix := key + "="
+	for _, t := range txt {
+		if strings.HasPrefix(t, prefix) {
+			return strings.TrimPrefix(t, prefix)
+		}
+	}
+	return ""
+}
+
 // StaticPeers reads newline-separated peer base URLs from a file.
 func StaticPeers(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
@@ -102,14 +136,15 @@ func StaticPeers(path string) ([]string, error) {
 	return peers, nil
 }
 
-// DiscoverPeers merges mDNS results with static peer list from config file.
-func DiscoverPeers(staticFile string, timeout time.Duration) ([]string, error) {
+// DiscoverPeers merges mDNS results (group-filtered) with the static peer list.
+// Static peers are still verified at request time via the group HTTP header.
+func DiscoverPeers(staticFile string, timeout time.Duration, group string) ([]string, error) {
 	static, err := StaticPeers(staticFile)
 	if err != nil {
 		return nil, err
 	}
 
-	d := NewDiscovery("llmirror", 0)
+	d := NewDiscovery("llmirror", 0, group)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	mdns, err := d.Browse(ctx)

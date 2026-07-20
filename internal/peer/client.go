@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lmangani/llmirror/internal/auth"
 	"github.com/lmangani/llmirror/internal/cache"
 )
 
@@ -19,14 +20,26 @@ type Client struct {
 	HTTP *http.Client
 }
 
-func NewClient() *Client {
+func NewClient(token string, group ...string) *Client {
+	g := ""
+	if len(group) > 0 {
+		g = group[0]
+	}
 	return &Client{
-		HTTP: &http.Client{Timeout: defaultTimeout},
+		HTTP: &http.Client{
+			Timeout: defaultTimeout,
+			Transport: auth.RoundTripper{
+				Token: token,
+				Group: g,
+				Base:  http.DefaultTransport,
+			},
+		},
 	}
 }
 
 type PeerModel struct {
 	RepoID    string            `json:"repo_id"`
+	RepoType  string            `json:"repo_type"`
 	Revisions []string          `json:"revisions"`
 	Refs      map[string]string `json:"refs"`
 }
@@ -49,23 +62,31 @@ func (c *Client) ListModels(baseURL string) ([]PeerModel, error) {
 
 type HasResponse struct {
 	RepoID       string `json:"repo_id"`
+	RepoType     string `json:"repo_type"`
 	Revision     string `json:"revision"`
 	RevisionHash string `json:"revision_hash"`
 	Present      bool   `json:"present"`
 }
 
 // HasRevision asks a peer whether it has an exact revision (named ref or commit).
-func (c *Client) HasRevision(baseURL, repoID, revision string) (*HasResponse, error) {
-	u := fmt.Sprintf("%s/v1/models/%s/has?revision=%s",
+func (c *Client) HasRevision(baseURL, repoID, revision string, repoType cache.RepoType) (*HasResponse, error) {
+	u := fmt.Sprintf("%s/v1/models/%s/has?revision=%s&repo_type=%s",
 		strings.TrimRight(baseURL, "/"),
 		escapeRepo(repoID),
 		url.QueryEscape(revision),
+		url.QueryEscape(repoType.String()),
 	)
 	resp, err := c.HTTP.Get(u)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("peer unauthorized (check LLMIRROR_TOKEN)")
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("peer forbidden (fleet group mismatch — check LLMIRROR_GROUP)")
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return &HasResponse{RepoID: repoID, Revision: revision, Present: false}, nil
 	}
@@ -81,22 +102,30 @@ func (c *Client) HasRevision(baseURL, repoID, revision string) (*HasResponse, er
 
 type ManifestResponse struct {
 	RepoID       string                `json:"repo_id"`
+	RepoType     string                `json:"repo_type"`
 	Revision     string                `json:"revision"`
 	RevisionHash string                `json:"revision_hash"`
 	Files        []cache.ManifestEntry `json:"files"`
 }
 
-func (c *Client) FetchManifest(baseURL, repoID, revision string) (*ManifestResponse, error) {
-	u := fmt.Sprintf("%s/v1/models/%s/manifest?revision=%s",
+func (c *Client) FetchManifest(baseURL, repoID, revision string, repoType cache.RepoType) (*ManifestResponse, error) {
+	u := fmt.Sprintf("%s/v1/models/%s/manifest?revision=%s&repo_type=%s",
 		strings.TrimRight(baseURL, "/"),
 		escapeRepo(repoID),
 		url.QueryEscape(revision),
+		url.QueryEscape(repoType.String()),
 	)
 	resp, err := c.HTTP.Get(u)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("peer unauthorized (check LLMIRROR_TOKEN)")
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("peer forbidden (fleet group mismatch — check LLMIRROR_GROUP)")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("peer manifest: %s", resp.Status)
 	}
@@ -126,11 +155,13 @@ func (c *Client) FetchBlob(baseURL, blobHash string, offset int64, w io.Writer) 
 	switch resp.StatusCode {
 	case http.StatusOK:
 		if offset > 0 {
-			// Server ignored Range — caller must restart from zero.
 			return fmt.Errorf("peer blob %s: expected 206 for range offset %d, got 200", blobHash, offset)
 		}
 	case http.StatusPartialContent:
-		// resume OK
+	case http.StatusUnauthorized:
+		return fmt.Errorf("peer unauthorized (check LLMIRROR_TOKEN)")
+	case http.StatusForbidden:
+		return fmt.Errorf("peer forbidden (fleet group mismatch — check LLMIRROR_GROUP)")
 	default:
 		return fmt.Errorf("peer blob %s: %s", blobHash, resp.Status)
 	}
@@ -142,25 +173,25 @@ func escapeRepo(repoID string) string {
 	return strings.ReplaceAll(repoID, "/", "%2F")
 }
 
-// CopyFromPeer pulls a model revision from a peer into the local HF cache.
-func CopyFromPeer(hubDir, baseURL, repoID, revision string) error {
-	client := NewClient()
-	manifest, err := client.FetchManifest(baseURL, repoID, revision)
+// CopyFromPeer pulls a revision from a peer into the local HF cache.
+func CopyFromPeer(hubDir, baseURL, repoID, revision string, repoType cache.RepoType, token, group string) error {
+	client := NewClient(token, group)
+	manifest, err := client.FetchManifest(baseURL, repoID, revision, repoType)
 	if err != nil {
 		return err
 	}
 	fetch := func(blobHash string, offset int64, w io.Writer) error {
 		return client.FetchBlob(baseURL, blobHash, offset, w)
 	}
-	return cache.ImportSnapshot(hubDir, repoID, revision, manifest.RevisionHash, manifest.Files, fetch)
+	return cache.ImportSnapshot(hubDir, repoID, revision, manifest.RevisionHash, manifest.Files, fetch, repoType)
 }
 
 // FindPeerWithModel returns the first peer that has the exact requested revision.
-func FindPeerWithModel(peers []string, repoID, revision string) (string, error) {
-	client := NewClient()
+func FindPeerWithModel(peers []string, repoID, revision string, repoType cache.RepoType, token, group string) (string, error) {
+	client := NewClient(token, group)
 	var lastErr error
 	for _, peerURL := range peers {
-		has, err := client.HasRevision(peerURL, repoID, revision)
+		has, err := client.HasRevision(peerURL, repoID, revision, repoType)
 		if err != nil {
 			lastErr = err
 			continue
@@ -170,14 +201,14 @@ func FindPeerWithModel(peers []string, repoID, revision string) (string, error) 
 		}
 	}
 	if lastErr != nil {
-		return "", fmt.Errorf("no peer has model %s@%s (last error: %w)", repoID, revision, lastErr)
+		return "", fmt.Errorf("no peer has %s %s@%s (last error: %w)", repoType, repoID, revision, lastErr)
 	}
-	return "", fmt.Errorf("no peer has model %s@%s", repoID, revision)
+	return "", fmt.Errorf("no peer has %s %s@%s", repoType, repoID, revision)
 }
 
 // PeerHasFile checks whether a peer can serve a specific snapshot file (via manifest).
-func (c *Client) PeerHasFile(baseURL, repoID, revision, filename string) (blobHash string, size int64, ok bool, err error) {
-	m, err := c.FetchManifest(baseURL, repoID, revision)
+func (c *Client) PeerHasFile(baseURL, repoID, revision, filename string, repoType cache.RepoType) (blobHash string, size int64, ok bool, err error) {
+	m, err := c.FetchManifest(baseURL, repoID, revision, repoType)
 	if err != nil {
 		return "", 0, false, err
 	}

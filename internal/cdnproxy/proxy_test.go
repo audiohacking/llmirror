@@ -28,7 +28,7 @@ func TestParseResolvePath(t *testing.T) {
 		},
 		{
 			path: "/datasets/glue/resolve/main/data.csv",
-			ok:   false, // datasets not served from model cache
+			ok:   true, repo: "glue", rev: "main", file: "data.csv",
 		},
 		{
 			path: "/api/models/gpt2",

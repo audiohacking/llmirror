@@ -14,8 +14,12 @@ type BlobFetcher func(blobHash string, offset int64, w io.Writer) error
 
 // ImportSnapshot copies blob files and snapshot layout from a remote manifest into the local HF cache.
 // Interrupted blob downloads leave `.partial` files and resume on the next attempt via Range requests.
-func ImportSnapshot(hubDir, repoID, revision, revisionHash string, files []ManifestEntry, fetchBlob BlobFetcher) error {
-	repoDir := filepath.Join(hubDir, RepoFolderName(repoID))
+func ImportSnapshot(hubDir, repoID, revision, revisionHash string, files []ManifestEntry, fetchBlob BlobFetcher, repoType ...RepoType) error {
+	t := RepoModel
+	if len(repoType) > 0 && repoType[0] != "" {
+		t = repoType[0]
+	}
+	repoDir := filepath.Join(hubDir, RepoFolderName(repoID, t))
 	if err := os.MkdirAll(filepath.Join(repoDir, "blobs"), 0o755); err != nil {
 		return err
 	}
@@ -50,7 +54,6 @@ func ensureBlob(path string, expectedSize int64, hash string, fetchBlob BlobFetc
 		if expectedSize <= 0 || info.Size() == expectedSize {
 			return nil
 		}
-		// Corrupt complete file — remove and re-fetch.
 		_ = os.Remove(path)
 	}
 	return writeBlobResumable(path, expectedSize, hash, fetchBlob)
@@ -87,7 +90,6 @@ func writeBlobResumable(path string, expectedSize int64, hash string, fetchBlob 
 	fetchErr := fetchBlob(hash, offset, f)
 	closeErr := f.Close()
 	if fetchErr != nil {
-		// Keep .partial for resume on next attempt.
 		return fetchErr
 	}
 	if closeErr != nil {

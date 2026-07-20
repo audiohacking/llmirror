@@ -49,7 +49,7 @@ PID_A=$!
 
 echo -n "==> wait for peer A"
 for _ in $(seq 1 50); do
-  if curl -sf "http://127.0.0.1:${PORT_A}/v1/models" >/dev/null; then
+  if curl -sf "http://127.0.0.1:${PORT_A}/healthz" >/dev/null; then
     echo " ready"
     break
   fi

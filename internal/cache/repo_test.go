@@ -8,12 +8,21 @@ func TestRepoFolderRoundTrip(t *testing.T) {
 	if folder != "models--meta-llama--Llama-2-7b-hf" {
 		t.Fatalf("unexpected folder: %s", folder)
 	}
-	back, err := RepoIDFromFolder(folder)
+	back, typ, err := RepoIDFromFolder(folder)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if back != repo {
-		t.Fatalf("got %q want %q", back, repo)
+	if back != repo || typ != RepoModel {
+		t.Fatalf("got %q %q", back, typ)
+	}
+
+	ds := RepoFolderName("glue", RepoDataset)
+	if ds != "datasets--glue" {
+		t.Fatalf("dataset folder: %s", ds)
+	}
+	id, typ, err := RepoIDFromFolder(ds)
+	if err != nil || id != "glue" || typ != RepoDataset {
+		t.Fatalf("got %q %q %v", id, typ, err)
 	}
 }
 
